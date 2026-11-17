@@ -207,7 +207,7 @@ async function handleMonitorMessage(data) {
                 failed: !results
             })
         } else if (data.type === "brightness") {
-            setBrightness(data.brightness, data.id)
+            await setBrightness(data.brightness, data.id)
         }  else if (data.type === "sdr") {
             setSDRBrightness(data.brightness, data.id)
         } else if (data.type === "gamma") {
@@ -262,7 +262,7 @@ async function handleMonitorMessage(data) {
         } else if (data.type === "localization") {
             localization = data.localization
         } else if (data.type === "vcp") {
-            setVCP(data.monitor, data.code, data.value)
+            await setVCP(data.monitor, data.code, data.value)
         } else if (data.type === "flushvcp") {
             vcpCache = {}
             monitorReports = {}
@@ -1735,7 +1735,7 @@ function setSDRBrightness(brightness, id) {
     }
 }
 
-function setBrightness(brightness, id) {
+async function setBrightness(brightness, id) {
     try {
         if (id) {
             let monitor = Object.values(monitors).find(mon => mon.id?.indexOf(id) >= 0)
@@ -1743,16 +1743,16 @@ function setBrightness(brightness, id) {
                 // Check if user has set a custom brightness VCP code for this monitor
                 const hasCustomBrightnessVCP = monitor.hwid && ddcBrightnessVCPs[monitor.hwid[1]]
                 if (monitor.type == "studio-display") {
-                    setStudioDisplayBrightness(monitor.serial, brightness)
+                    await setStudioDisplayBrightness(monitor.serial, brightness)
                 } else if (monitor.type === "software") {
                     if (setSoftwareBrightness(monitor, brightness) === false) {
                         console.log(`Couldn't set software brightness for monitor ${monitor.id}`)
                         return false
                     }
                 } else if(!settings.disableHighLevel && monitor.highLevelSupported?.brightness && !hasCustomBrightnessVCP) {
-                    setHighLevelBrightness(monitor.hwid.join("#"), brightness)
+                    if (await setHighLevelBrightness(monitor.hwid.join("#"), brightness) === false) return false
                 } else {
-                    setVCP(monitor.hwid.join("#"), monitor.brightnessType, brightness)
+                    if (await setVCP(monitor.hwid.join("#"), monitor.brightnessType, brightness) === false) return false
                 }
                 // Update tracked brightness values
                 const brightnessRaw = monitor.type === "software"
@@ -1881,11 +1881,22 @@ function getMonitorInputs(monitor, currentInput) {
     return ddcci.getMonitorInputs(monitor, currentInput)
 }
 
+// Brightness and contrast share a DDC bus. Let each monitor finish processing
+// its last command before starting another write, including after failures.
+const lastDDCWrite = new Map()
+async function waitForDDCWrite(monitor) {
+    const previous = lastDDCWrite.get(monitor)
+    if (previous === undefined) return
+    const remaining = 100 - (performance.now() - previous)
+    if (remaining > 0) await wait(remaining)
+}
+
 async function setVCP(monitor, code, value) {
     if(isDDCBlocked(monitor)) return false;
     if(busyLevel > 0) while(busyLevel > 0) { await wait(100) } // Wait until no longer busy
     try {
         const vcpString = vcpStr(code)
+        await waitForDDCWrite(monitor)
         let result = ddcci._setVCP(monitor, code, (value * 1))
         if (vcpCache[monitor]?.["vcp_" + vcpString]) {
             vcpCache[monitor]["vcp_" + vcpString][0] = (value * 1)
@@ -1901,6 +1912,8 @@ async function setVCP(monitor, code, value) {
     } catch (e) {
         console.log(`Error setting VCP code ${vcpStr(code)} for ${monitor}. Reason: ${classifyDDCError(e)}`)
         return false
+    } finally {
+        lastDDCWrite.set(monitor, performance.now())
     }
 }
 
@@ -1919,11 +1932,14 @@ async function setHighLevelBrightness(monitor, value) {
     if(isDDCBlocked(monitor)) return false;
     if(busyLevel > 0) while(busyLevel > 0) { await wait(100) } // Wait until no longer busy
     try {
+        await waitForDDCWrite(monitor)
         let result = ddcci._setHighLevelBrightness(monitor, value)
         return result
     } catch (e) {
         console.log(e)
         return false
+    } finally {
+        lastDDCWrite.set(monitor, performance.now())
     }
 }
 
@@ -2164,6 +2180,7 @@ function vcpStr(code) {
 // node-ddcci as error.win32Code. Message strings from Windows are
 // localized, so failures are classified by code instead.
 const DDC_ERROR_REASONS = {
+    31: "device communication failed",
     0xC0262580: "I2C not supported",                    // ERROR_GRAPHICS_I2C_NOT_SUPPORTED
     0xC0262581: "I2C device does not exist",            // ERROR_GRAPHICS_I2C_DEVICE_DOES_NOT_EXIST
     0xC0262582: "I2C bus error (transmit)",             // ERROR_GRAPHICS_I2C_ERROR_TRANSMITTING_DATA
@@ -2291,8 +2308,30 @@ process.send({
 // cache mutations in one worker-side queue so a late IPC message cannot
 // interleave with a refresh or a capabilities read.
 let monitorMessageQueue = Promise.resolve()
-process.on('message', data => {
+let pendingMonitorWrites = new Map()
+function queueMonitorMessage(data) {
+    let target
+    if (data.type === "vcp" && [0x10, 0x12, 0x13, 0x62].includes(Number(data.code))) {
+        target = `vcp:${data.monitor}:${Number(data.code)}`
+    } else if (["brightness", "sdr", "gamma"].includes(data.type)) {
+        target = `${data.type}:${data.id || ""}`
+    }
+
+    // Reads, settings, and refreshes seal the current group. A newer write
+    // must stay after that barrier, even when it targets the same control.
+    if (target === undefined) pendingMonitorWrites = new Map()
+    const pending = pendingMonitorWrites
+    const token = {}
+    if (target !== undefined) pending.set(target, token)
     monitorMessageQueue = monitorMessageQueue
-        .then(() => handleMonitorMessage(data))
+        .then(async () => {
+            if (target !== undefined) {
+                if (pending.get(target) !== token) return
+                pending.delete(target)
+            }
+            await handleMonitorMessage(data)
+        })
         .catch(e => console.log(e))
-})
+    return monitorMessageQueue
+}
+process.on('message', queueMonitorMessage)
