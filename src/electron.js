@@ -4599,7 +4599,7 @@ app.on('quit', () => {
     BrightnessKeys.unregister()
     nativeBrightnessKeysRegistered = false
     stopNativeBrightnessKeyRepeat()
-    tray.destroy()
+    tray?.destroy()
   } catch (e) {
 
   }
@@ -5367,8 +5367,7 @@ powerMonitor.on("resume", async () => {
   setRecentlyInteracted(false)
   
   if(settings.restartOnWake) {
-  // Screw it, just restart the whole app.
-    tray.destroy()
+    // The quit handler cleans up the tray icon if it exists.
     app.relaunch()
     app.exit()
     return
