@@ -5,7 +5,7 @@ const vm = require('node:vm')
 const path = require('node:path')
 const source = fs.readFileSync(path.join(__dirname, '../src/Monitors.js'), 'utf8')
 const ast = require('@babel/parser').parse(source, { sourceType: 'script' })
-const names = ['handleMonitorMessage', 'setBrightness', 'setVCP', 'setHighLevelBrightness',
+const names = ['checkVCP', 'handleMonitorMessage', 'setBrightness', 'setVCP', 'setHighLevelBrightness',
   'waitForDDCWrite', 'lastDDCWrite', 'queueMonitorMessage', 'monitorMessageQueue', 'pendingMonitorWrites']
 const declarations = ast.program.body.filter(node => names.includes(node.id?.name || node.declarations?.[0]?.id?.name))
 function setup() {
@@ -87,4 +87,17 @@ test('the message queue awaits a paced brightness write before accepting a contr
   await done
   assert.equal(calls.length, 2)
   assert.ok(calls[1].time - calls[0].time >= 100)
+})
+
+test('strict contrast snapshots reject cached VCP data after a hardware read failure', async () => {
+  const { context, monitor } = setup()
+  const replies = []
+  context.getDDCCI = () => {}
+  context.process = { send: reply => replies.push(reply) }
+  context.vcpCache[monitor.id] = { vcp_0x12: [33, 100] }
+  context.ddcci._getVCP = () => { throw new Error('device read failed') }
+  await context.handleMonitorMessage({ type: 'getVCP', monitor: monitor.id, code: 18, useCachedOnError: false })
+  assert.equal(replies.at(-1).value, false)
+  await context.handleMonitorMessage({ type: 'getVCP', monitor: monitor.id, code: 18 })
+  assert.deepEqual(replies.at(-1).value, [33, 100])
 })

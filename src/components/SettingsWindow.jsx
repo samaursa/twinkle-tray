@@ -1518,6 +1518,11 @@ export default class SettingsWindow extends PureComponent {
                                                 </div>
                                             } />
                                     </SettingsOption>
+                                    <SettingsOption title={T.t("SETTINGS_TIME_IDLE_CONTRAST_TITLE")} description={T.t("SETTINGS_TIME_IDLE_CONTRAST_DESC")} input={this.renderToggle("detectIdleContrastEnabled")}>
+                                        <SettingsChild title={T.t("SETTINGS_TIME_IDLE_CONTRAST_LEVEL")} input={
+                                            <input type="number" min="0" max="100" value={this.state.rawSettings.detectIdleContrastLevel ?? 5} onChange={(e) => this.setSetting("detectIdleContrastLevel", Math.max(0, Math.min(100, Number(e.target.value))))} />
+                                        } />
+                                    </SettingsOption>
                                     <SettingsOption title={T.t("SETTINGS_TIME_IDLE_FS_TITLE")} description={T.t("SETTINGS_TIME_IDLE_FS_DESC")} input={this.renderToggle("detectIdleCheckFullscreen")} />
                                     <SettingsOption title={T.t("SETTINGS_TIME_IDLE_MEDIA_TITLE")} description={T.t("SETTINGS_TIME_IDLE_MEDIA_DESC")} input={this.renderToggle("detectIdleMedia")} />
                                 </div>

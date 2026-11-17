@@ -274,7 +274,7 @@ async function handleMonitorMessage(data) {
             canUseWmiBridge = data.value
         } else if (data.type === "getVCP") {
             getDDCCI()
-            const vcp = await checkVCP(data.monitor, data.code)
+            const vcp = await checkVCP(data.monitor, data.code, false, data.useCachedOnError !== false)
             process.send({
                 type: `getVCP::${data.monitor}::${data.code}`,
                 monitor: data.monitor,

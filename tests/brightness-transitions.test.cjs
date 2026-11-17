@@ -11,7 +11,7 @@ const names = [
   'updateBrightnessThrottle', 'flushBrightnessThrottle', 'applyLinkedFeatures',
   'updateBrightness', 'normalizeBrightness', 'transitionBrightness', 'stopBrightnessTransition',
   'hasRecentlyInteracted', 'brightnessInteractionVersion', 'setRecentlyInteracted', 'idleCheckShort',
-  'currentTransition', 'brightnessThrottleTargets', 'idleInteractionVersion'
+  'currentTransition', 'brightnessThrottleTargets', 'idleInteractionVersion', 'idleContrastSession', 'restoreIdleContrast', 'recordIdleAdjustment', 'idleOwnsContrast', 'finishIdleContrastRestore'
 ]
 const declarations = ast.program.body.filter(node =>
   names.includes(node.id?.name || node.declarations?.[0]?.id?.name)

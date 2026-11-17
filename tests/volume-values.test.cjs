@@ -54,7 +54,7 @@ function createContext(featureSettings) {
         scaleVolume, Utils: require(path.join(root, 'src/Utils')),
         settings: { monitorFeaturesSettings: { TEST: { '0x62': featureSettings } }, monitorFeatures: { TEST: { '0x62': true } } },
         monitors: { ONE: monitor }, monitorsThread: { send: message => messages.push(message) },
-        isWindowsUserIdle: false, stopBrightnessTransition() {}, brightnessThrottleTargets: new Map(),
+        isWindowsUserIdle: false, idleContrastSession: null, idleOwnsContrast: () => false, stopBrightnessTransition() {}, brightnessThrottleTargets: new Map(),
         usesExtendedMinimum: () => false, shouldSkipDisplay: () => false,
         setTrayPercent() {}, updateKnownDisplays() {},
         console: { log() {} }, debug: { error: (...args) => { throw new Error(args.join(' ')) } }

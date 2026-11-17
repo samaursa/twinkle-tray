@@ -548,7 +548,7 @@ function stopMonitorThread() {
   return stopPromise
 }
 
-async function getVCP(monitor, code) {
+async function getVCP(monitor, code, useCachedOnError = true) {
   // Offset/cycle hotkeys need a real value; don't let a synchronous
   // capabilities request turn their three-second timeout into -1.
   await waitForMonitorWorkerIdle()
@@ -575,7 +575,8 @@ async function getVCP(monitor, code) {
     monitorsThread.send({
       type: "getVCP",
       code: vcpParsed,
-      monitor: hwid
+      monitor: hwid,
+      useCachedOnError
     })
   })
 }
@@ -925,6 +926,8 @@ const defaultSettings = {
   hideClosedLid: false,
   getDDCBrightnessUpdates: false,
   detectIdleTimeEnabled: false,
+  detectIdleContrastEnabled: false,
+  detectIdleContrastLevel: 5,
   detectIdleTimeSeconds: 0,
   detectIdleTimeMinutes: 5,
   detectIdleCheckFullscreen: false,
@@ -1975,6 +1978,7 @@ async function doHotkey(hotkey, options = {}) {
             for (const hotkeyMonitor of hotkeyMonitors) {
               const { monitor, value } = hotkeyMonitor
               if (action.target === "brightness") {
+                recordIdleAdjustment(monitor.id)
                 const normalizedAdjust = minMax(value)
                 monitors[monitor.key].brightness = normalizedAdjust
                 sendToAllWindows('monitors-updated', monitors);
@@ -1988,6 +1992,7 @@ async function doHotkey(hotkey, options = {}) {
                 }
                 showOverlay = true
               } else if(action.target === "sdr") {
+                recordIdleAdjustment(monitor.id, "sdr")
                 updateBrightnessThrottle(monitor.id, parseInt(value), false, true, "sdr")
               } else {
                 let vcpCode = action.target
@@ -1998,6 +2003,7 @@ async function doHotkey(hotkey, options = {}) {
                 } else if (action.target === "powerState") {
                   vcpCode = "0xD2"
                 }
+                recordIdleAdjustment(monitor.id, vcpCode)
                 updateBrightnessThrottle(monitor.id, parseInt(value), false, true, parseInt(vcpCode))
                 sendToAllWindows('monitors-updated', monitors);
               }
@@ -2736,6 +2742,7 @@ function hasEnabledLinkedFeatures() {
 
 function deferFeatureUpdate(monitor, level, useCap, vcpValue, clearTransition = true, excludedLinkedFeatures = []) {
   if (!monitor?.id) return false
+  if (vcpValue === "brightness" && idleOwnsContrast(monitor)) excludedLinkedFeatures = [...new Set([...excludedLinkedFeatures, 0x12])]
   deferredFeatureUpdates.set(`${monitor.id}:${vcpValue}`, {
     generation: monitorRefreshGeneration,
     monitorId: monitor.id,
@@ -2750,6 +2757,7 @@ function deferFeatureUpdate(monitor, level, useCap, vcpValue, clearTransition = 
 
 function deferLinkedFeatureUpdate(monitor, level, useCap, excludedLinkedFeatures = []) {
   if (!monitor?.id) return false
+  if (idleOwnsContrast(monitor)) excludedLinkedFeatures = [...new Set([...excludedLinkedFeatures, 0x12])]
   deferredLinkedFeatureUpdates.set(monitor.id, {
     generation: monitorRefreshGeneration,
     monitorId: monitor.id,
@@ -2783,6 +2791,7 @@ function flushDeferredFeatureUpdates() {
       applyLinkedFeatures(monitor, update.level, update.useCap, update.excludedLinkedFeatures)
     }
   }
+  if (idleContrastSession?.phase === "pendingRestore") finishIdleContrastRestore(idleContrastSession)
 }
 
 function clearFeaturesPendingAfterEnrichmentFailure() {
@@ -3132,6 +3141,7 @@ function applyLinkedFeatures(monitor, newLevel, useCap = true, excludedLinkedFea
   if (!featuresSettings) return
 
   for(const vcp in monitor.features || {}) {
+    if (parseInt(vcp) === 0x12 && idleOwnsContrast(monitor)) continue
     if (excludedLinkedFeatures.includes(parseInt(vcp))) continue
     if(featuresSettings[vcp]?.linked && settings.monitorFeatures?.[monitor.hwid[1]]?.[vcp]) {
       const maxBrightness = (featuresSettings[vcp].maxVisual ?? 100)
@@ -3414,6 +3424,7 @@ function updateAllBrightness(brightness, mode = "offset") {
 
   // Send brightness updates
   for (let key in monitors) {
+    recordIdleAdjustment(monitors[key].id)
     updateBrightnessThrottle(monitors[key].id, monitors[key].brightness, true, false)
   }
 }
@@ -3456,7 +3467,7 @@ function stopBrightnessTransition() {
   currentTransition = null
 }
 
-function transitionBrightness(level, eventMonitors = {}, stepSpeed = 1, explicitTargets = false) {
+function transitionBrightness(level, eventMonitors = {}, stepSpeed = 1, explicitTargets = false, excludedLinkedFeatures = []) {
   stopBrightnessTransition()
 
   // Slow down transition
@@ -3497,7 +3508,7 @@ function transitionBrightness(level, eventMonitors = {}, stepSpeed = 1, explicit
 
       const remaining = target - monitor.brightness
       const next = Math.abs(remaining) <= step ? target : monitor.brightness + Math.sign(remaining) * step
-      if (updateBrightness(monitor.id, next, true, "brightness", false) && next !== target) {
+      if (updateBrightness(monitor.id, next, true, "brightness", false, excludedLinkedFeatures) && next !== target) {
         hasMoreSteps = true
       } else {
         completed.add(monitor.id)
@@ -3641,6 +3652,7 @@ ipcMain.on('request-colors', () => {
 
 ipcMain.on('update-brightness', function (event, data) {
   setRecentlyInteracted(true)
+  recordIdleAdjustment(data.index)
   updateBrightnessThrottle(data.index, data.level, true, false)
 
   // If overlay is visible, keep it open
@@ -3747,14 +3759,17 @@ ipcMain.on('set-volume', (e, values) => {
 
 ipcMain.on('set-vcp', (e, values) => {
   setRecentlyInteracted(true)
+  recordIdleAdjustment(values.monitor, values.code)
   updateBrightnessThrottle(values.monitor, values.value, false, true, values.code)
 })
 ipcMain.on('set-sdr-brightness', (e, values) => {
   setRecentlyInteracted(true)
+  recordIdleAdjustment(values.monitor, "sdr")
   updateBrightnessThrottle(values.monitor, values.value, false, true, "sdr")
 })
 ipcMain.on('set-gamma-brightness', (e, values) => {
   setRecentlyInteracted(true)
+  recordIdleAdjustment(values.monitor, "gamma")
   setGammaBrightnessThrottle(values.monitor, values.value)
 })
 
@@ -4291,11 +4306,13 @@ function windowMatchesProfile(window) {
   return foundProfile
 }
 
-function applyProfileBrightness(profile) {
+function applyProfileBrightness(profile, userSelected = false) {
   try {
+    if (userSelected) setRecentlyInteracted(true)
     Object.values(monitors)?.forEach(monitor => {
       // Displays whose slider was never moved have no stored level. Use the 50 the settings slider shows.
       const level = profile.monitors?.[monitor.id]
+      if (userSelected) recordIdleAdjustment(monitor.id)
       updateBrightness(monitor.id, (Number.isFinite(level) ? level : 50), true, "brightness")
     })
     sendToAllWindows('monitors-updated', monitors)
@@ -4698,7 +4715,7 @@ function getProfilesMenuItem() {
       const profiles = []
       for(const profile of settings.profiles) {
         if(profile.showInMenu && profile.setBrightness) {
-          profiles.push({ label: profile.name, type: 'normal', click: (e) => applyProfileBrightness(profile) })
+          profiles.push({ label: profile.name, type: 'normal', click: (e) => applyProfileBrightness(profile, true) })
         }
       }
       if(profiles.length) {
@@ -5526,6 +5543,103 @@ let lastIdleTime = 0
 
 let preIdleMonitors = {}
 
+// Each idle cycle owns only the contrast values it successfully read.
+let idleContrastSession = null
+
+function idleOwnsContrast(monitor) {
+  const session = idleContrastSession
+  if (!session) return false
+  const manual = session.overridden.get(monitor.id)
+  if (manual === "contrast") return true
+  const saved = session.contrasts.get(monitor.id)
+  return !!saved && manual !== "brightness"
+    && (session.phase !== "pendingRestore" || saved.restorePending)
+}
+
+function finishIdleContrastRestore(session) {
+  if (!session || idleContrastSession !== session) return
+  if (restoreIdleContrast(session)) idleContrastSession = null
+  else session.phase = "pendingRestore"
+}
+
+async function captureIdleContrast(session) {
+  for (const monitor of Object.values(monitors)) {
+    if (idleContrastSession !== session || session.phase !== "snapshot") return
+    if (session.contrasts.has(monitor.id)) continue
+    if (monitor.type !== "ddcci" || !monitor.features?.["0x12"]
+      || monitor.featuresPending || monitor.featuresRefreshing
+      || settings.hideDisplays?.[monitor.key] || shouldSkipDisplay(monitor, true)) continue
+
+    const raw = await getVCP(monitor, 0x12, false)
+    if (idleContrastSession !== session || session.phase !== "snapshot") return
+    const maximum = monitor.features["0x12"][1]
+    if (!Number.isFinite(raw) || raw < 0 || !Number.isFinite(maximum) || maximum <= 0 || raw > maximum) {
+      console.log("Idle contrast: skipping unreadable display", monitor.id)
+      continue
+    }
+    session.contrasts.set(monitor.id, { raw, maximum, dimmed: false })
+  }
+}
+
+function writeIdleContrast(monitor, raw, maximum) {
+  if (!monitor?.features?.["0x12"] || monitor.featuresPending || monitor.featuresRefreshing
+    || settings.hideDisplays?.[monitor.key] || shouldSkipDisplay(monitor)
+    || !Number.isFinite(raw) || raw < 0 || !Number.isFinite(maximum) || maximum <= 0 || raw > maximum) return false
+
+  // A raw idle write replaces older normalized contrast work in the same control.
+  const state = brightnessThrottleTargets.get(monitor.id + "::0x12")
+  if (state) {
+    clearTimeout(state.timeout)
+    state.timeout = false
+    state.pending = null
+    state.lastTime = Date.now()
+  }
+  for (const [key, update] of deferredFeatureUpdates) {
+    if (update.monitorId === monitor.id && parseInt(update.vcpValue) === 0x12) deferredFeatureUpdates.delete(key)
+  }
+
+  const feature = settings.monitorFeaturesSettings?.[monitor.hwid[1]]?.["0x12"]
+  const minimum = feature?.min ?? 0
+  const maximumPercent = feature?.max ?? 100
+  monitor.features["0x12"][0] = maximumPercent > minimum
+    ? normalizeBrightness(raw * 100 / maximum, true, minimum, maximumPercent)
+    : 0
+  monitorsThread.send({ type: "vcp", monitor: monitor.hwid.join("#"), code: 0x12, value: Math.round(raw) })
+  return true
+}
+
+function restoreIdleContrast(session) {
+  if (!session || idleContrastSession !== session) return true
+  let restored = true
+  for (const [id, saved] of session.contrasts) {
+    if (!saved.dimmed || session.overridden.has(id)) continue
+    if (session.phase === "pendingRestore" && !saved.restorePending) continue
+    const monitor = Object.values(monitors).find(display => display.id === id)
+    saved.restorePending = !writeIdleContrast(monitor, saved.raw, saved.maximum)
+    if (saved.restorePending) restored = false
+  }
+  return restored
+}
+
+// Called at user input entry points, before linked feature work is generated.
+function recordIdleAdjustment(index, vcp = "brightness") {
+  const session = idleContrastSession
+  if (!session) return
+  const monitor = Object.values(monitors).find(display => display.id === index || display.key === index)
+  if (!monitor) return
+
+  const brightness = ["brightness", "sdr", "gamma"].includes(vcp)
+  if (brightness) session.brightnessChanged = true
+  const linkedContrast = settings.monitorFeatures?.[monitor.hwid[1]]?.["0x12"]
+    && settings.monitorFeaturesSettings?.[monitor.hwid[1]]?.["0x12"]?.linked
+    && !(monitor.hdr === "active" && settings.sdrAsMainSliderDisplays?.[monitor.key])
+  if (parseInt(vcp) === 0x12 || (vcp === "brightness" && linkedContrast)) {
+    session.overridden.set(monitor.id, parseInt(vcp) === 0x12 ? "contrast" : "brightness")
+    const deferred = deferredLinkedFeatureUpdates.get(monitor.id)
+    if (deferred) deferred.excludedLinkedFeatures = [...new Set([...(deferred.excludedLinkedFeatures || []), 0x12])]
+  }
+}
+
 function getIdleSettingValue() {
   const detectIdleTime = (parseInt(settings.detectIdleTimeSeconds) + (settings.detectIdleTimeMinutes * 60))
   return detectIdleTime
@@ -5542,13 +5656,43 @@ function idleCheckLong() {
 }
 
 async function startIdleCheckShort() {
+  if (notIdleMonitor) return
+  const pendingContrasts = new Map()
+  if (idleContrastSession) {
+    clearTimeout(idleContrastSession.restoreTimer)
+    restoreIdleContrast(idleContrastSession)
+    for (const [id, saved] of idleContrastSession.contrasts) {
+      if (saved.restorePending && !idleContrastSession.overridden.has(id)) pendingContrasts.set(id, saved)
+    }
+  }
+  const session = {
+    phase: "snapshot",
+    contrasts: pendingContrasts,
+    overridden: new Map(),
+    brightnessChanged: false,
+    interactionVersion: brightnessInteractionVersion,
+    restoreTimer: null
+  }
+  idleContrastSession = session
+  userIdleDimmed = false
   idleInteractionVersion = brightnessInteractionVersion
   isUserIdle = true
-  await updateKnownDisplays(true, true)
-  preIdleMonitors = Object.assign({}, lastKnownDisplays)
-  console.log(`\x1b[36mStarted short idle monitor.\x1b[0m`)
-  if (notIdleMonitor) clearInterval(notIdleMonitor);
   notIdleMonitor = setInterval(idleCheckShort, 1000)
+  await updateKnownDisplays(true, true)
+  if (idleContrastSession !== session || session.phase !== "snapshot") return
+  preIdleMonitors = Object.assign({}, lastKnownDisplays)
+  if (settings.detectIdleTimeEnabled && settings.detectIdleContrastEnabled) await captureIdleContrast(session)
+  if (idleContrastSession !== session || session.phase !== "snapshot") return
+  if (session.brightnessChanged || session.overridden.size || session.interactionVersion !== brightnessInteractionVersion || powerMonitor.getSystemIdleTime() < getIdleSettingValue()) {
+    clearInterval(notIdleMonitor)
+    notIdleMonitor = false
+    isUserIdle = false
+    finishIdleContrastRestore(session)
+    updateKnownDisplays()
+    return
+  }
+  session.phase = "ready"
+  console.log("Started short idle monitor.")
 }
 
 function isFocusedWindowFullscreen() {
@@ -5576,26 +5720,42 @@ function isMediaPlaying() {
 
 function idleCheckShort() {
   try {
+    const session = idleContrastSession
     const idleTime = powerMonitor.getSystemIdleTime()
 
-    if (!userIdleDimmed && settings.detectIdleTimeEnabled && !settings.disableAutoApply && idleTime >= getIdleSettingValue() && !isFocusedWindowFullscreen() && !isMediaPlaying()) {
+    if ((!session || session.phase === "ready") && !userIdleDimmed && settings.detectIdleTimeEnabled && !settings.disableAutoApply && idleTime >= getIdleSettingValue() && !isFocusedWindowFullscreen() && !isMediaPlaying()) {
       console.log(`\x1b[36mUser idle. Dimming displays.\x1b[0m`)
       userIdleDimmed = true
+      if (session) session.phase = "dimmed"
       idleMonitorBlock?.release?.()
       idleMonitorBlock = blockBadDisplays("idle:start")
       try {
         const transitionMonitors = {}
+        const excludedContrast = settings.detectIdleContrastEnabled ? [0x12] : []
+        if (session) {
+          const requestedLevel = Number(settings.detectIdleContrastLevel)
+          const level = Number.isFinite(requestedLevel) ? Math.max(0, Math.min(100, requestedLevel)) : 5
+          for (const [id, saved] of session.contrasts) {
+            if (session.overridden.has(id)) continue
+            const monitor = Object.values(monitors).find(display => display.id === id)
+            const feature = settings.monitorFeaturesSettings?.[monitor?.hwid[1]]?.["0x12"]
+            const percent = normalizeBrightness(level, false, feature?.min ?? 0, feature?.max ?? 100)
+            const raw = Math.min(saved.raw, Math.round(percent * saved.maximum / 100))
+            saved.dimmed = writeIdleContrast(monitor, raw, saved.maximum) || saved.dimmed
+            saved.restorePending = saved.dimmed
+          }
+        }
         Object.values(monitors)?.forEach((monitor) => {
           if(!shouldSkipDisplay(monitor, true)) {
             if(settings.idleTransitionSpeed) {
               transitionMonitors[monitor.id] = 0
             } else {
-              updateBrightness(monitor.id, 0, true, "brightness")
+              updateBrightness(monitor.id, 0, true, "brightness", false, excludedContrast)
             }
           }
         })
         if(Object.keys(transitionMonitors).length) {
-          transitionBrightness(undefined, transitionMonitors, settings.idleTransitionSpeed, true)
+          transitionBrightness(undefined, transitionMonitors, settings.idleTransitionSpeed, true, excludedContrast)
         }
       } catch (e) {
         console.log(`Error dimming displays`, e)
@@ -5609,7 +5769,9 @@ function idleCheckShort() {
       notIdleMonitor = false
 
       // Input can arrive before the one-second wake check. Keep that adjustment.
-      const adjustedWhileIdle = brightnessInteractionVersion !== idleInteractionVersion
+      if (session) session.phase = "restoring"
+      stopBrightnessTransition()
+      const adjustedWhileIdle = session?.brightnessChanged ?? (brightnessInteractionVersion !== idleInteractionVersion)
       if (!adjustedWhileIdle) {
         // Different behavior depending on if idle dimming is on
         if (settings.detectIdleTimeEnabled) {
@@ -5624,16 +5786,19 @@ function idleCheckShort() {
         }
       }
 
+      restoreIdleContrast(session)
       idleMonitorBlock?.release?.()
 
       // Retry the restore for slow displays unless the user has since adjusted them.
       const wakeInteractionVersion = brightnessInteractionVersion
-      setTimeout(() => {
+      const restoreTimer = setTimeout(() => {
+        if (idleContrastSession !== session) return
         isUserIdle = false
         userIdleDimmed = false
         lastIdleTime = 1
 
-        if (adjustedWhileIdle || brightnessInteractionVersion !== wakeInteractionVersion) {
+        if (adjustedWhileIdle || (session ? session.brightnessChanged : brightnessInteractionVersion !== wakeInteractionVersion)) {
+          finishIdleContrastRestore(session)
           updateKnownDisplays()
           return
         }
@@ -5652,8 +5817,10 @@ function idleCheckShort() {
         }
 
         block.release()
+        finishIdleContrastRestore(session)
 
       }, parseInt(settings.idleRestoreSeconds || 4) * 1000)
+      if (session) session.restoreTimer = restoreTimer
 
     }
     lastIdleTime = idleTime
@@ -6069,6 +6236,7 @@ function handleCommandLine(event, argv, directory, additionalData) {
         } else {
           const newBrightness = minMax(type === "set" ? brightness : display.brightness + brightness)
           console.log(`Setting brightness via command line: Display #${display.num} (${display.name}) @ ${newBrightness}%`);
+          recordIdleAdjustment(display.id)
           updateBrightnessThrottle(display.id, newBrightness, true)
         }
 
@@ -6077,6 +6245,7 @@ function handleCommandLine(event, argv, directory, additionalData) {
       if (display && ddcciVCP) {
         if (display === "all") {
           Object.values(monitors).forEach(monitor => {
+            recordIdleAdjustment(monitor.id, ddcciVCP.code)
             monitorsThread.send({
               type: "vcp",
               code: ddcciVCP.code,
@@ -6085,6 +6254,7 @@ function handleCommandLine(event, argv, directory, additionalData) {
             })
           })
         } else {
+          recordIdleAdjustment(display.id, ddcciVCP.code)
           monitorsThread.send({
             type: "vcp",
             code: ddcciVCP.code,
@@ -6293,8 +6463,10 @@ const handleClientMessage = async (message, remote) => {
 
       if (data.vcp === "brightness") {
         const newBrightness = minMax(data.mode !== "offset" ? value : monitor.brightness + value)
+        recordIdleAdjustment(monitor.id)
         updateBrightnessThrottle(monitor.id, newBrightness, true)
       } else {
+        recordIdleAdjustment(monitor.id, determineVCP(data.vcp))
         monitorsThread.send({
           type: "vcp",
           code: determineVCP(data.vcp),
