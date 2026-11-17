@@ -20,10 +20,6 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     updateProgress: 0,
     isRefreshing: window.isRefreshing
   })
-  const [doBackgroundEvent, setDoBackgroundEvent] = useState(false)
-  const [levelsChanged, setLevelsChanged] = useState(false)
-  const [init, setInit] = useState(false)
-  const [lastLevels, setLastLevels] = useState([])
   const [T] = useState(new TranslateReact({}, {}))
   const [, setLocalizationVersion] = useState(0)
 
@@ -35,7 +31,6 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     return localNumMonitors
   }, [state.monitors, state.hideDisplays])
 
-  let updateInterval = null
   let panelHeight = -1
 
   // Enable/Disable linked levels
@@ -47,65 +42,31 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     })
   }
 
-  // Handle <Slider> changes
+  // Send intent immediately; the main process throttles writes per monitor.
   const handleChange = (level, slider) => {
+    if (!numMonitors) return
+
     const monitors = { ...state.monitors }
-    const sliderMonitor = monitors[slider.props.hwid]
-    if (numMonitors && state.linkedLevelsActive) {
-      // Update all monitors (linked)
-      for (let key in monitors) {
-        const monitor = monitors[key]
-        monitor.brightness = level
-      }
-      setState(prev => ({ ...prev, monitors }))
-      setLevelsChanged(true)
-      if (state.updateInterval === 999) syncBrightness()
-    } else if (numMonitors > 0) {
-      // Update single monitor
-      if (sliderMonitor) sliderMonitor.brightness = level;
-      setState(prev => ({ ...prev, monitors }))
-      setLevelsChanged(true)
-      if (state.updateInterval === 999) syncBrightness()
-    }
+    const targetKeys = state.linkedLevelsActive ? Object.keys(monitors) : [slider.props.hwid]
     window.pauseMonitorUpdates()
+    for (const key of targetKeys) {
+      const monitor = monitors[key]
+      if (!monitor || !isAdjustableDisplay(monitor) || state.hideDisplays?.[key]) continue
+      monitors[key] = { ...monitor, brightness: level }
+      window.updateBrightness(monitor.id, level)
+    }
+    setState(prev => ({ ...prev, monitors }))
   }
 
   // Update monitor info
   const recievedMonitors = (e) => {
     let newMonitors = { ...e.detail }
-    setLastLevels([])
     // Reset panel height so it's recalculated
     panelHeight = -1
     setState(prev => ({
       ...prev,
       monitors: newMonitors
     }))
-    // Delay initial adjustments
-    if (!init) setTimeout(() => { setInit(true) }, 333)
-  }
-
-  const updateMinMax = (inMonitors = false) => {
-    if (numMonitors > 0) {
-      let newMonitors = Object.assign((inMonitors ? inMonitors : state.monitors), {})
-      for (let key in newMonitors) {
-        for (let remap in state.remaps) {
-          if (newMonitors[key].name == remap) {
-            newMonitors[key].min = state.remaps[remap].min
-            newMonitors[key].max = state.remaps[remap].max
-          }
-        }
-      }
-      setLevelsChanged(true)
-      if (inMonitors) {
-        return inMonitors
-      } else {
-        setState(prev => ({
-          ...prev,
-          monitors: newMonitors
-        }))
-        setDoBackgroundEvent(true)
-      }
-    }
   }
 
   // Update settings
@@ -113,23 +74,15 @@ const BrightnessPanel = memo(function BrightnessPanel() {
     const settings = e.detail
     const linkedLevelsActive = (settings.linkedLevelsActive ?? false)
     const sleepAction = (settings.sleepAction ?? "none")
-    const updateInterval = (settings.updateInterval || 500) * 1
-    const remaps = (settings.remaps || {})
     const names = (settings.names || {})
     const hideDisplays = (settings.hideDisplays || {})
-    setLevelsChanged(true)
     setState(prev => ({
       ...prev,
       linkedLevelsActive,
-      remaps,
       names,
       hideDisplays,
-      updateInterval,
       sleepAction
     }))
-    resetBrightnessInterval()
-    updateMinMax()
-    setDoBackgroundEvent(true)
   }
 
   const recievedUpdate = (e) => {
@@ -143,39 +96,8 @@ const BrightnessPanel = memo(function BrightnessPanel() {
 
 
 
-  // Send new brightness to monitors, if changed
-  const syncBrightness = () => {
-    const monitors = state.monitors
-    if (init && levelsChanged && (window.showPanel || doBackgroundEvent) && numMonitors) {
-      setDoBackgroundEvent(false)
-      setLevelsChanged(false)
-      try {
-        for (let idx in monitors) {
-          if (isAdjustableDisplay(monitors[idx]) && monitors[idx].brightness != lastLevels[idx]) {
-            window.updateBrightness(monitors[idx].id, monitors[idx].brightness)
-          }
-        }
-      } catch (e) {
-        console.error("Could not update brightness")
-      }
-    }
-  }
-
-  const resetBrightnessInterval = () => {
-    if (updateInterval) clearInterval(updateInterval)
-    updateInterval = setInterval(() => syncBrightness(), (state.updateInterval || 500))
-  }
-
   const handleIsRefreshingUpdate = (e) => setState(prev => ({ ...prev, isRefreshing: e.detail }))
   const handleUpdateProgress = (e) => setState(prev => ({ ...prev, updateProgress: e.detail.progress }))
-
-  useEffect(() => {
-    resetBrightnessInterval()
-    return () => {
-      clearInterval(updateInterval)
-    }
-  }, [state.monitors, numMonitors, doBackgroundEvent, levelsChanged, init])
-
 
   useEffect(() => {
     const handleMonitorsUpdated = (e) => recievedMonitors(e)
@@ -200,7 +122,7 @@ const BrightnessPanel = memo(function BrightnessPanel() {
       window.addEventListener("updateProgress", handleProgressUpdated)
     }
 
-    // Update brightness every interval, if changed
+    // Request the initial settings and monitor state
     window.requestSettings()
     window.requestMonitors()
     window.ipc.send('request-localization')

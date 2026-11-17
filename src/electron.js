@@ -1766,7 +1766,7 @@ function applyProfile(profile = {}, useTransition = false, transitionSpeed = 1, 
 
   if (useTransition) {
     // If using smooth transition
-    let transitionMonitors = []
+    const transitionMonitors = {}
     for (const hwid in profile) {
       try {
         const monitor = profile[hwid]
@@ -1774,7 +1774,7 @@ function applyProfile(profile = {}, useTransition = false, transitionSpeed = 1, 
         transitionMonitors[monitor.id] = monitor.brightness
       } catch (e) { console.log("Couldn't set brightness for known display!") }
     }
-    transitionBrightness(50, transitionMonitors, transitionSpeed)
+    transitionBrightness(undefined, transitionMonitors, transitionSpeed, true)
   } else {
     // If not using a transition
     for (const hwid in profile) {
@@ -1834,6 +1834,15 @@ let hotkeyOverlayTimeout
 let hotkeyThrottle = []
 let doingHotkey = false
 const hotkeyCycleIndexes = []
+function getHotkeyLinkedFeatureOverrides(hotkey, monitor) {
+  const featureCodes = { contrast: 0x12, volume: 0x62, powerState: 0xD2 }
+  return hotkey.actions.filter(action =>
+    ["set", "offset", "cycle"].includes(action.type)
+    && (action.type !== "cycle" || action.values?.length)
+    && (action.allMonitors || (settings.linkedLevelsActive && !settings.hotkeysBreakLinkedLevels) || action.monitors?.[monitor.id])
+  ).map(action => featureCodes[action.target] ?? parseInt(action.target)).filter(Number.isFinite)
+}
+
 async function doHotkey(hotkey, options = {}) {
   const now = Date.now()
   if (!doingHotkey && (hotkeyThrottle[hotkey.id] === undefined || now > hotkeyThrottle[hotkey.id] + 100)) {
@@ -1969,7 +1978,7 @@ async function doHotkey(hotkey, options = {}) {
                 const normalizedAdjust = minMax(value)
                 monitors[monitor.key].brightness = normalizedAdjust
                 sendToAllWindows('monitors-updated', monitors);
-                updateBrightnessThrottle(monitor.id, monitors[monitor.key].brightness, true, false)
+                updateBrightnessThrottle(monitor.id, monitors[monitor.key].brightness, true, false, "brightness", true, getHotkeyLinkedFeatureOverrides(hotkey, monitor))
                 pauseMonitorUpdates() // Stop incoming updates for a moment to prevent judder
 
                 // Break linked levels
@@ -2725,7 +2734,7 @@ function hasEnabledLinkedFeatures() {
   }
 }
 
-function deferFeatureUpdate(monitor, level, useCap, vcpValue, clearTransition = true) {
+function deferFeatureUpdate(monitor, level, useCap, vcpValue, clearTransition = true, excludedLinkedFeatures = []) {
   if (!monitor?.id) return false
   deferredFeatureUpdates.set(`${monitor.id}:${vcpValue}`, {
     generation: monitorRefreshGeneration,
@@ -2733,18 +2742,20 @@ function deferFeatureUpdate(monitor, level, useCap, vcpValue, clearTransition = 
     level,
     useCap,
     vcpValue,
-    clearTransition
+    clearTransition,
+    excludedLinkedFeatures
   })
   return true
 }
 
-function deferLinkedFeatureUpdate(monitor, level, useCap) {
+function deferLinkedFeatureUpdate(monitor, level, useCap, excludedLinkedFeatures = []) {
   if (!monitor?.id) return false
   deferredLinkedFeatureUpdates.set(monitor.id, {
     generation: monitorRefreshGeneration,
     monitorId: monitor.id,
     level,
-    useCap
+    useCap,
+    excludedLinkedFeatures
   })
   return true
 }
@@ -2761,7 +2772,7 @@ function flushDeferredFeatureUpdates() {
     if (update.generation !== monitorRefreshGeneration) continue
     const monitor = Object.values(monitors).find(item => item?.id === update.monitorId)
     if (monitor) {
-      updateBrightness(update.monitorId, update.level, update.useCap, update.vcpValue, update.clearTransition)
+      updateBrightness(update.monitorId, update.level, update.useCap, update.vcpValue, update.clearTransition, update.excludedLinkedFeatures)
     }
   }
 
@@ -2769,7 +2780,7 @@ function flushDeferredFeatureUpdates() {
     if (update.generation !== monitorRefreshGeneration) continue
     const monitor = Object.values(monitors).find(item => item?.id === update.monitorId)
     if (monitor) {
-      applyLinkedFeatures(monitor, update.level, update.useCap)
+      applyLinkedFeatures(monitor, update.level, update.useCap, update.excludedLinkedFeatures)
     }
   }
 }
@@ -3050,7 +3061,11 @@ function flushGammaBrightness() {
 // Throttle state per monitor + VCP target: when it was last written, the
 // latest update waiting to be written, and the timer that will write it.
 const brightnessThrottleTargets = new Map()
-function updateBrightnessThrottle(id, level, useCap = true, sendUpdate = true, vcp = "brightness") {
+function updateBrightnessThrottle(id, level, useCap = true, sendUpdate = true, vcp = "brightness", clearTransition = true, excludedLinkedFeatures = []) {
+  // Cancel on submission so a trailing write cannot stop a newer transition.
+  if (clearTransition && !isWindowsUserIdle && Number.isFinite(parseFloat(level))) {
+    stopBrightnessTransition()
+  }
   // A monitor can receive its brightness update and several linked feature
   // updates at once. Keep each VCP target separate so one linked feature does
   // not replace another feature (or the brightness update) in the queue.
@@ -3070,13 +3085,13 @@ function updateBrightnessThrottle(id, level, useCap = true, sendUpdate = true, v
   const now = Date.now()
   if (!state.timeout && now >= state.lastTime + settings.updateInterval) {
     state.lastTime = now
-    updateBrightness(id, level, useCap, vcp)
+    updateBrightness(id, level, useCap, vcp, false, excludedLinkedFeatures)
     if (sendUpdate) sendToAllWindows('monitors-updated', monitors);
     return true
   }
 
   // Keep only the latest level, but still notify windows if any skipped update asked to
-  state.pending = { id, level, useCap, vcp, sendUpdate: (sendUpdate || state.pending?.sendUpdate) }
+  state.pending = { id, level, useCap, vcp, excludedLinkedFeatures, sendUpdate: (sendUpdate || state.pending?.sendUpdate) }
   if (!state.timeout) {
     // Each target has its own timer, so it's never written sooner than
     // updateInterval after its own last write
@@ -3092,7 +3107,7 @@ function flushBrightnessThrottle(state) {
   if (!update) return
   state.lastTime = Date.now()
   try {
-    updateBrightness(update.id, update.level, update.useCap, update.vcp)
+    updateBrightness(update.id, update.level, update.useCap, update.vcp, false, update.excludedLinkedFeatures)
   } catch (e) {
     console.error(e)
   }
@@ -3112,11 +3127,12 @@ function hasEnabledLinkedFeaturesForMonitor(monitor) {
   )
 }
 
-function applyLinkedFeatures(monitor, newLevel, useCap = true) {
+function applyLinkedFeatures(monitor, newLevel, useCap = true, excludedLinkedFeatures = []) {
   const featuresSettings = settings.monitorFeaturesSettings?.[monitor.hwid?.[1]]
   if (!featuresSettings) return
 
   for(const vcp in monitor.features || {}) {
+    if (excludedLinkedFeatures.includes(parseInt(vcp))) continue
     if(featuresSettings[vcp]?.linked && settings.monitorFeatures?.[monitor.hwid[1]]?.[vcp]) {
       const maxBrightness = (featuresSettings[vcp].maxVisual ?? 100)
       let processedLevel = newLevel
@@ -3127,15 +3143,15 @@ function applyLinkedFeatures(monitor, newLevel, useCap = true) {
       const capped = parseInt(normalizeBrightness(processedLevel, true, 0, maxBrightness))
       if (vcp === "0x62") {
         // Scale volume the same way the volume sliders do, so it respects the maximum override
-        updateBrightnessThrottle(monitor.id, scaleVolume(capped, monitor.features[vcp], featuresSettings[vcp]), useCap, false, "volume-raw")
+        updateBrightnessThrottle(monitor.id, scaleVolume(capped, monitor.features[vcp], featuresSettings[vcp]), useCap, false, "volume-raw", false)
       } else {
-        updateBrightnessThrottle(monitor.id, capped, useCap, false, vcp)
+        updateBrightnessThrottle(monitor.id, capped, useCap, false, vcp, false)
       }
     }
   }
 }
 
-function updateBrightness(index, newLevel, useCap = true, vcpValue = "brightness", clearTransition = true) {
+function updateBrightness(index, newLevel, useCap = true, vcpValue = "brightness", clearTransition = true, excludedLinkedFeatures = []) {
   if(isWindowsUserIdle) return false; // Skip if displays are off
   // NaN reaches the worker as null, which the VCP path writes as 0
   if (!Number.isFinite(parseFloat(newLevel))) {
@@ -3190,18 +3206,26 @@ function updateBrightness(index, newLevel, useCap = true, vcpValue = "brightness
     // used for brightness, but queue feature work until it is safe to run.
     if ((monitor.featuresPending || monitor.featuresRefreshing) && vcp !== "gamma"
       && ((vcp !== "brightness" && vcp !== "sdr") || monitor.type === "none")) {
-      deferFeatureUpdate(monitor, newLevel, useCap, vcpValue, clearTransition)
+      deferFeatureUpdate(monitor, newLevel, useCap, vcpValue, clearTransition, excludedLinkedFeatures)
       return true
-    }
-
-    if (clearTransition && currentTransition) {
-      clearInterval(currentTransition)
-      currentTransition = null
     }
 
     if(shouldSkipDisplay(monitor)) {
       console.log(`\x1b[31mSkipping monitor ${monitor.id} due to rules list\x1b[0m`)
       return false
+    }
+
+    if (clearTransition) stopBrightnessTransition()
+
+    // A direct brightness write supersedes any older slider value waiting to flush.
+    if (vcpValue === "brightness") {
+      const state = brightnessThrottleTargets.get(`${monitor.id}::brightness`)
+      if (state) {
+        clearTimeout(state.timeout)
+        state.timeout = false
+        state.pending = null
+        state.lastTime = Date.now()
+      }
     }
 
     // Split the slider range: above the breakpoint drives hardware brightness,
@@ -3253,9 +3277,9 @@ function updateBrightness(index, newLevel, useCap = true, vcpValue = "brightness
       // The ramp replaced this display's brightness control, but its other
       // DDC/CI features still follow the slider.
       if (monitor.featuresPending && hasEnabledLinkedFeaturesForMonitor(monitor)) {
-        deferLinkedFeatureUpdate(monitor, newLevel, useCap)
+        deferLinkedFeatureUpdate(monitor, newLevel, useCap, excludedLinkedFeatures)
       } else {
-        applyLinkedFeatures(monitor, newLevel, useCap)
+        applyLinkedFeatures(monitor, newLevel, useCap, excludedLinkedFeatures)
       }
     } else if (monitor.type == "ddcci") {
       if (vcp === "brightness") {
@@ -3276,9 +3300,9 @@ function updateBrightness(index, newLevel, useCap = true, vcpValue = "brightness
 
         // Apply linked DDC/CI features now, or replay them after enrichment.
         if (monitor.featuresPending && hasEnabledLinkedFeaturesForMonitor(monitor)) {
-          deferLinkedFeatureUpdate(monitor, newLevel, useCap)
+          deferLinkedFeatureUpdate(monitor, newLevel, useCap, excludedLinkedFeatures)
         } else {
-          applyLinkedFeatures(monitor, newLevel, useCap)
+          applyLinkedFeatures(monitor, newLevel, useCap, excludedLinkedFeatures)
         }
       } else {
         const vcpString = `0x${parseInt(vcp).toString(16).toUpperCase()}`
@@ -3340,12 +3364,16 @@ function updateBrightness(index, newLevel, useCap = true, vcpValue = "brightness
         ignoreBrightnessEvent = false
         ignoreBrightnessEventTimeout = false
       }, 500)
+    } else {
+      return false
     }
 
     setTrayPercent()
     updateKnownDisplays()
+    return true
   } catch (e) {
     debug.error("Could not update brightness", e)
+    return false
   }
 }
 
@@ -3423,8 +3451,13 @@ function normalizeBrightness(brightness, normalize = false, min = 0, max = 100, 
 }
 
 let currentTransition = null
-function transitionBrightness(level, eventMonitors = [], stepSpeed = 1) {
-  if (currentTransition !== null) clearInterval(currentTransition);
+function stopBrightnessTransition() {
+  clearInterval(currentTransition)
+  currentTransition = null
+}
+
+function transitionBrightness(level, eventMonitors = {}, stepSpeed = 1, explicitTargets = false) {
+  stopBrightnessTransition()
 
   // Slow down transition
   let transitionIntervalMult = 1
@@ -3442,42 +3475,37 @@ function transitionBrightness(level, eventMonitors = [], stepSpeed = 1) {
     default: stepSpeedMult = 1; break;
   }
 
-  const step = (stepSpeed * stepSpeedMult)
+  const step = Number(stepSpeed) * stepSpeedMult
+  if (!Number.isFinite(step) || step <= 0) return
 
+  const completed = new Set()
   currentTransition = setInterval(() => {
-    if (recentlyWokeUp || isWindowsUserIdle) clearInterval(currentTransition);
-    let numDone = 0
-    for (let key in monitors) {
-      const monitor = monitors[key]
+    if (recentlyWokeUp || isWindowsUserIdle) {
+      stopBrightnessTransition()
+      return
+    }
 
-      let normalized = level * 1
-      if (settings.adjustmentTimeIndividualDisplays) {
-        // If using individual monitor settings
-        normalized = (eventMonitors[monitor.id] >= 0 ? eventMonitors[monitor.id] : level)
-      }
+    let hasMoreSteps = false
+    for (const monitor of Object.values(monitors)) {
+      if (completed.has(monitor.id) || settings.hideDisplays?.[monitor.key] || shouldSkipDisplay(monitor)) continue
 
-      if (settings.remaps) {
-        for (let remapName in settings.remaps) {
-          if (remapName == monitor.name) {
-            normalized = normalized
-          }
-        }
-      }
-      if (!Number.isFinite(monitor.brightness) || !Number.isFinite(parseFloat(normalized))) {
-        // Nothing to step from or to, so don't hold the transition open
-        numDone++
-      } else if (monitor.brightness < normalized + (step + 1) && monitor.brightness > normalized - (step + 1)) {
-        updateBrightness(monitor.id, normalized, undefined, undefined, false)
-        numDone++
+      const individualTarget = eventMonitors[monitor.id]
+      const target = Number(explicitTargets || (settings.adjustmentTimeIndividualDisplays && individualTarget >= 0)
+        ? individualTarget
+        : level)
+      if (!Number.isFinite(monitor.brightness) || !Number.isFinite(target)) continue
+
+      const remaining = target - monitor.brightness
+      const next = Math.abs(remaining) <= step ? target : monitor.brightness + Math.sign(remaining) * step
+      if (updateBrightness(monitor.id, next, true, "brightness", false) && next !== target) {
+        hasMoreSteps = true
       } else {
-        updateBrightness(monitor.id, (monitor.brightness < normalized ? monitor.brightness + step : monitor.brightness - step), undefined, undefined, false)
-      }
-      sendToAllWindows('monitors-updated', monitors)
-      if (numDone === Object.keys(monitors).length) {
-        clearInterval(currentTransition);
-        currentTransition = null
+        completed.add(monitor.id)
       }
     }
+
+    if (!hasMoreSteps) stopBrightnessTransition()
+    sendToAllWindows('monitors-updated', monitors)
   }, settings.updateInterval * transitionIntervalMult)
 }
 
@@ -3517,11 +3545,13 @@ function applyAnimatedBrightness(level, eventMonitors = [], readableMonitorIds =
 
 // Flag recent user activity to skip certain events
 let hasRecentlyInteracted = false
+let brightnessInteractionVersion = 0
 function setRecentlyInteracted(hasInteracted) {
   if(hasRecentlyInteracted) clearTimeout(hasRecentlyInteracted);
   if(!hasInteracted) {
     hasRecentlyInteracted = false
   } else {
+    brightnessInteractionVersion++
     hasRecentlyInteracted = setTimeout(() => {
       hasRecentlyInteracted = false
     }, 5000)
@@ -3611,7 +3641,7 @@ ipcMain.on('request-colors', () => {
 
 ipcMain.on('update-brightness', function (event, data) {
   setRecentlyInteracted(true)
-  updateBrightness(data.index, data.level)
+  updateBrightnessThrottle(data.index, data.level, true, false)
 
   // If overlay is visible, keep it open
   if (hotkeyOverlayTimeout) {
@@ -5487,6 +5517,7 @@ let isUserIdle = false // Idle detection as defined by Twinkle Tray
 let userIdleInterval = false // Check if idle
 let userCheckingForActiveInterval = false // Check if came back
 let userIdleDimmed = false
+let idleInteractionVersion = 0
 let idleMonitorBlock
 let isWindowsUserIdle = false // Idle detection as defined by Windows
 
@@ -5512,6 +5543,7 @@ function idleCheckLong() {
 }
 
 async function startIdleCheckShort() {
+  idleInteractionVersion = brightnessInteractionVersion
   isUserIdle = true
   await updateKnownDisplays(true, true)
   preIdleMonitors = Object.assign({}, lastKnownDisplays)
@@ -5564,7 +5596,7 @@ function idleCheckShort() {
           }
         })
         if(Object.keys(transitionMonitors).length) {
-          transitionBrightness(0, transitionMonitors, settings.idleTransitionSpeed)
+          transitionBrightness(undefined, transitionMonitors, settings.idleTransitionSpeed, true)
         }
       } catch (e) {
         console.log(`Error dimming displays`, e)
@@ -5577,25 +5609,35 @@ function idleCheckShort() {
       clearInterval(notIdleMonitor)
       notIdleMonitor = false
 
-      // Different behavior depending on if idle dimming is on
-      if (settings.detectIdleTimeEnabled) {
-        // Always restore when dimmed
-        const block = blockBadDisplays("idle:restore")
-        setKnownBrightness(false)
-        block.release()
-      } else {
-        // Not dimmed, try checking ToD first. sKB as backup.
-        const foundEvent = applyCurrentAdjustmentEvent(true, true)
-        if (!foundEvent && !settings.disableAutoApply) setKnownBrightness(false);
+      // Input can arrive before the one-second wake check. Keep that adjustment.
+      const adjustedWhileIdle = brightnessInteractionVersion !== idleInteractionVersion
+      if (!adjustedWhileIdle) {
+        // Different behavior depending on if idle dimming is on
+        if (settings.detectIdleTimeEnabled) {
+          // Always restore when dimmed
+          const block = blockBadDisplays("idle:restore")
+          setKnownBrightness(false)
+          block.release()
+        } else {
+          // Not dimmed, try checking ToD first. sKB as backup.
+          const foundEvent = applyCurrentAdjustmentEvent(true, true)
+          if (!foundEvent && !settings.disableAutoApply) setKnownBrightness(false);
+        }
       }
 
       idleMonitorBlock?.release?.()
 
-      // Wait a little longer, re-apply known brightness in case monitors take a moment, and finish up
+      // Retry the restore for slow displays unless the user has since adjusted them.
+      const wakeInteractionVersion = brightnessInteractionVersion
       setTimeout(() => {
         isUserIdle = false
         userIdleDimmed = false
         lastIdleTime = 1
+
+        if (adjustedWhileIdle || brightnessInteractionVersion !== wakeInteractionVersion) {
+          updateKnownDisplays()
+          return
+        }
 
         const block = blockBadDisplays("idle:end")
 
